@@ -43,6 +43,13 @@ def parse_args():
     p.add_argument("--max_period", type=float, default=1.50, help="Max cycle period (s)")
     p.add_argument("--x_clip", type=float, default=1.5, help="Clip X to this upper bound")
     p.add_argument("--rate", type=float, default=500.0, help="Estimated sample rate for buffer sizing (Hz)")
+    p.add_argument("--stats_win", type=float, default=3.0, help="Short stats window for adaptive thresholds (s)")
+    p.add_argument("--peak_ema_tau", type=float, default=2.0, help="Time constant (s) for EMA of accepted peak amplitudes")
+    p.add_argument("--thr_on_k", type=float, default=0.35, help="ON threshold scale vs ref (dimensionless)")
+    p.add_argument("--thr_off_k", type=float, default=0.25, help="OFF threshold scale vs ref (dimensionless, <thr_on_k)")
+    p.add_argument("--min_prom_k", type=float, default=0.10, help="Min peak prominence as fraction of ref")
+    p.add_argument("--min_width_s", type=float, default=0.10, help="Minimum burst width (s)")
+    p.add_argument("--use_iqr_thr", action="store_true", help="Use median+IQR instead of P95 for ref")
     return p.parse_args()
 
 
@@ -65,48 +72,77 @@ def hp_alpha(fc, dt):
 # --------------------- Real-time EMG Processor ---------------------
 class RealtimeEMGProcessor:
     """
-    Minimal real-time EMG processing chain:
-      raw -> HPF(~20Hz) -> LPF(~450Hz) ~ band-pass
-          -> full-wave rectification -> envelope LPF (~4Hz)
-
-    Cycle detection on envelope:
-      - dynamic threshold = 0.2 * moving P95
-      - local maxima above threshold with refractory time (min_period)
-    Generalized intensity X:
-      - mean envelope per cycle / moving P95  (clipped to [0, x_clip])
+    Real-time EMG chain with adaptive thresholds:
+      raw -> HPF(~20Hz) -> LPF(~450Hz) -> rect -> envelope LPF(~4Hz)
+    Hysteretic burst detector with:
+      - short-window stats (P95 or median+IQR) updated every sample
+      - EMA of accepted peak amplitudes (fast adaptation)
+      - dual thresholds (ON/OFF), min width, prominence, period constraints
+    X = mean envelope per accepted burst / (normalization ref), clipped.
     """
+
     def __init__(self, env_lp_hz=4.0, hpf_hz=20.0, lpf_hz=450.0,
-                 min_period=0.30, max_period=1.50, x_clip=1.5, win_sec=10.0):
+                 min_period=0.30, max_period=1.50, x_clip=1.5, win_sec=10.0,
+                 stats_win=3.0, peak_ema_tau=2.0,
+                 thr_on_k=0.35, thr_off_k=0.25, min_prom_k=0.10,
+                 min_width_s=0.10, use_iqr_thr=False):
+        # filtering params
         self.env_lp_hz = env_lp_hz
         self.hpf_hz = hpf_hz
         self.lpf_hz = lpf_hz
+
+        # timing & normalization
         self.min_period = min_period
         self.max_period = max_period
         self.x_clip = x_clip
-        self.win_sec = win_sec
+        self.win_sec = win_sec  # for X normalization history (longer)
+        self.stats_win = stats_win  # short window for thresholds
+        self.use_iqr_thr = use_iqr_thr
 
-        # internal states
+        # detector params
+        self.thr_on_k = thr_on_k
+        self.thr_off_k = thr_off_k
+        self.min_prom_k = min_prom_k
+        self.min_width_s = min_width_s
+        self.peak_ema_tau = peak_ema_tau
+
+        # filter states
         self.prev_t = None
         self.hp_y = 0.0
         self.hp_xprev = 0.0
         self.lp_y = 0.0
         self.env_y = 0.0
 
-        self.env_history = deque()
+        # histories (long for X, short for thresholds)
         self.env_times = deque()
+        self.env_history = deque()        # long (win_sec)
+        self.env_times_short = deque()
+        self.env_history_short = deque()  # short (stats_win)
 
+        # detector states
+        self.active = False
+        self.burst_start_t = None
+        self.peak_val = -np.inf
+        self.peak_t = None
         self.last_peak_t = None
         self.last_val = None
         self.rising = False
 
+        # per-cycle accumulation (for X)
         self.cycle_id = -1
         self.in_cycle = False
         self.cycle_env_sum = 0.0
         self.cycle_nsamp = 0
 
-        self.X_series = deque()   # (t, X)
-        self.peaks = deque()      # (t_peak, env_peak)
+        # outputs
+        self.X_series = deque()         # (t, X)
+        self.peaks = deque()            # (t_peak, env_peak)
+        self.last_activation_hz = None  # latest f_act (Hz)
 
+        # adaptive refs
+        self.peak_amp_ema = None  # EMA of (peak_val - baseline)
+
+    # --- helpers ---
     def _update_dt(self, t):
         if self.prev_t is None:
             self.prev_t = t
@@ -132,85 +168,145 @@ class RealtimeEMGProcessor:
         self.env_y += a * (x - self.env_y)
         return self.env_y
 
-    def _prune_history(self, tnow):
+    def _prune_histories(self, tnow):
+        # prune long history (for X normalization)
         while self.env_times and (tnow - self.env_times[0] > self.win_sec):
             self.env_times.popleft()
             self.env_history.popleft()
+        # prune short history (for thresholds)
+        while self.env_times_short and (tnow - self.env_times_short[0] > self.stats_win):
+            self.env_times_short.popleft()
+            self.env_history_short.popleft()
 
-    def _moving_p95(self):
-        if not self.env_history:
-            return None
-        vals = np.fromiter((v for v in self.env_history), dtype=float)
-        return float(np.percentile(vals, 95))
+    def _short_stats(self):
+        """Return (ref, base) from short history.
+           If use_iqr_thr: base=median, ref=IQR; else base=median, ref=P95."""
+        if not self.env_history_short:
+            return None, None
+        vals = np.fromiter((v for v in self.env_history_short), dtype=float)
+        med = float(np.median(vals))
+        if self.use_iqr_thr:
+            q25, q75 = np.percentile(vals, [25, 75])
+            ref = float(max(1e-9, q75 - q25))  # IQR as scale
+        else:
+            ref = float(np.percentile(vals, 95))  # P95 as scale
+        return ref, med
+
+    @staticmethod
+    def _ema_update(ema, value, dt, tau):
+        """Exponential moving average with time constant tau (s)."""
+        if tau <= 1e-6:
+            return float(value)
+        alpha = 1.0 - np.exp(-dt / tau)
+        return (1.0 - alpha) * (ema if ema is not None else value) + alpha * value
 
     def process(self, t, raw):
-        """
-        Returns dict with:
-          filtered, envelope, is_peak(bool), cycle_id, X
-        """
         dt = self._update_dt(t)
         if dt is None:
-            return dict(filtered=raw, envelope=0.0, is_peak=False, cycle_id=-1, X=None)
+            return dict(filtered=raw, envelope=0.0, is_peak=False,
+                        cycle_id=-1, X=None, activation_hz=None)
 
-        # band-pass filtering
+        # filtering chain
         x_hp = self._hp(raw, dt)
         x_bp = self._lp(x_hp, dt)
-
-        # rectification and envelope
         rect = abs(x_bp)
         env = self._env_lp(rect, dt)
 
-        # keep history
-        self.env_times.append(t)
-        self.env_history.append(env)
-        self._prune_history(t)
+        # histories
+        self.env_times.append(t); self.env_history.append(env)
+        self.env_times_short.append(t); self.env_history_short.append(env)
+        self._prune_histories(t)
 
-        # dynamic threshold
-        p95 = self._moving_p95()
-        thr = 0.2 * p95 if (p95 is not None and p95 > 0) else 0.0
+        # short-window stats
+        ref_s, base = self._short_stats()
+        if ref_s is None or ref_s <= 0.0:
+            # not enough history yet
+            self.last_val = env
+            return dict(filtered=x_bp, envelope=env, is_peak=False,
+                        cycle_id=self.cycle_id, X=None, activation_hz=None)
+
+        # blend with EMA of accepted peaks for faster adaptation
+        if self.peak_amp_ema is not None:
+            # reference must be strictly positive
+            ref = max(1e-9, 0.5 * ref_s + 0.5 * self.peak_amp_ema)
+        else:
+            ref = ref_s
+
+        # hysteresis thresholds
+        thr_on  = base + self.thr_on_k  * ref
+        thr_off = base + self.thr_off_k * ref
 
         is_peak = False
+        f_out = None
         X_out = None
 
-        # peak detection
-        if self.last_val is None:
-            self.last_val = env
-
-        if env > self.last_val:
-            self.rising = True
-        elif env < self.last_val:
-            if self.rising and self.last_val > thr:
-                t_candidate = t
-                ok_period = True
-                if self.last_peak_t is not None:
-                    period = t_candidate - self.last_peak_t
-                    ok_period = (self.min_period <= period <= self.max_period)
-                if ok_period:
-                    is_peak = True
-                    self.last_peak_t = t_candidate
-                    self.peaks.append((t_candidate, self.last_val))
-
-                    # finalize last cycle
-                    if self.in_cycle and self.cycle_nsamp > 0 and p95 and p95 > 0:
-                        cycle_mean = self.cycle_env_sum / self.cycle_nsamp
-                        X = min(self.x_clip, max(0.0, cycle_mean / p95))
-                        X_out = X
-                        self.X_series.append((t_candidate, X))
-
-                    # start new cycle
-                    self.cycle_id += 1
-                    self.in_cycle = True
-                    self.cycle_env_sum = 0.0
-                    self.cycle_nsamp = 0
-            self.rising = False
-
-        if self.in_cycle:
+        # state machine
+        if not self.active:
+            if env >= thr_on:
+                self.active = True
+                self.burst_start_t = t
+                self.peak_val = env
+                self.peak_t = t
+                # start cycle accumulation
+                self.cycle_id += 1
+                self.in_cycle = True
+                self.cycle_env_sum = env
+                self.cycle_nsamp = 1
+        else:
+            # track true apex
+            if env > self.peak_val:
+                self.peak_val = env
+                self.peak_t = t
+            # accumulate for X
             self.cycle_env_sum += env
             self.cycle_nsamp += 1
+            # burst end?
+            if env <= thr_off:
+                width_ok = (t - self.burst_start_t) >= self.min_width_s
+                prom_ok  = (self.peak_val - base) >= (self.min_prom_k * ref)
+                period_ok = True
+                if self.last_peak_t is not None:
+                    period = self.peak_t - self.last_peak_t
+                    period_ok = (self.min_period <= period <= self.max_period)
+
+                if width_ok and prom_ok and period_ok:
+                    # activation frequency
+                    if self.last_peak_t is not None:
+                        p = self.peak_t - self.last_peak_t
+                        if p > 1e-6:
+                            f_out = 1.0 / p
+                            self.last_activation_hz = f_out
+                    # accept this peak
+                    is_peak = True
+                    self.peaks.append((self.peak_t, self.peak_val))
+
+                    # update EMA of accepted peak amplitude above baseline
+                    amp_above = max(1e-9, self.peak_val - base)
+                    self.peak_amp_ema = self._ema_update(
+                        self.peak_amp_ema, amp_above, dt, self.peak_ema_tau
+                    )
+
+                    # compute X (normalize by ref used above)
+                    if self.in_cycle and self.cycle_nsamp > 0 and ref > 0:
+                        cycle_mean = self.cycle_env_sum / self.cycle_nsamp
+                        X = min(self.x_clip, max(0.0, cycle_mean / ref))
+                        X_out = X
+                        self.X_series.append((self.peak_t, X))
+
+                    self.last_peak_t = self.peak_t
+
+                # reset burst state
+                self.active = False
+                self.burst_start_t = None
+                self.peak_val = -np.inf
+                self.peak_t = None
+                self.in_cycle = False
+                self.cycle_env_sum = 0.0
+                self.cycle_nsamp = 0
 
         self.last_val = env
-
-        return dict(filtered=x_bp, envelope=env, is_peak=is_peak, cycle_id=self.cycle_id, X=X_out)
+        return dict(filtered=x_bp, envelope=env, is_peak=is_peak,
+                    cycle_id=self.cycle_id, X=X_out, activation_hz=f_out)
 
 
 # --------------------- Data buffer ---------------------
@@ -304,14 +400,22 @@ def main():
     q_local = queue.Queue(maxsize=10000)
     rb = RingBuffer(window_sec=args.window, est_rate_hz=args.rate)
     proc = RealtimeEMGProcessor(
-        env_lp_hz=args.env_lp_hz,
-        hpf_hz=args.hpf_hz,
-        lpf_hz=args.lpf_hz,
-        min_period=args.min_period,
-        max_period=args.max_period,
-        x_clip=args.x_clip,
-        win_sec=args.window
+    env_lp_hz=args.env_lp_hz,
+    hpf_hz=args.hpf_hz,
+    lpf_hz=args.lpf_hz,
+    min_period=args.min_period,
+    max_period=args.max_period,
+    x_clip=args.x_clip,
+    win_sec=args.window,           # long history for X
+    stats_win=args.stats_win,      # short window for thresholds
+    peak_ema_tau=args.peak_ema_tau,
+    thr_on_k=args.thr_on_k,
+    thr_off_k=args.thr_off_k,
+    min_prom_k=args.min_prom_k,
+    min_width_s=args.min_width_s,
+    use_iqr_thr=args.use_iqr_thr
     )
+
 
     running = {"ok": True}
     def stop(*_): running["ok"] = False
